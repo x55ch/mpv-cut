@@ -21,24 +21,6 @@ Use `Shift+C` for cutting with a smaller file size. Disclaimer: This will result
 
 ## Settings
 The settings can be changed by editing the [script](https://github.com/b1scoito/mpv-cut/blob/main/mpv_cut.lua#L7) file.
-```lua
-local settings = {
-    key_mark_cut = "c",
-    video_extension = "mp4",
-
-    -- if you want faster cutting, leave this blank
-    ffmpeg_custom_parameters = "",
-
-    web = {
-        -- small file settings
-        key_mark_cut = "shift+c",
-
-        audio_target_bitrate = "128", -- kbps
-        video_target_file_size = "8",  -- mb
-        video_target_scale = "1280:-1" -- https://trac.ffmpeg.org/wiki/Scaling everthing after "scale=" will be considered, keep "original" for no changes to the scaling
-    }
-}
-```
 
 ### Further explanation
 
