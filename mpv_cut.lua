@@ -1,607 +1,317 @@
 ---@diagnostic disable: lowercase-global, undefined-global
 
-msg = require("mp.msg")
-utils = require("mp.utils")
+local msg = require("mp.msg")
+local utils = require("mp.utils")
 
--- #region globals
-local settings = {
+-- ============================================================================
+-- 1. CONFIGURATION
+-- ============================================================================
+local Config = {
     key_mark_cut = "c",
+    web_key_mark_cut = "shift+c",
     video_extension = "mp4",
 
-    -- if you want faster cutting, leave this blank
-    ffmpeg_custom_parameters = "",
-
     web = {
-        -- small file settings
-        key_mark_cut = "shift+c",
-
-        audio_target_bitrate = 128, -- ((kbps))
-        video_target_file_size = 8,  -- MB
-        video_target_scale = "1280:-2" -- https://trac.ffmpeg.org/wiki/Scaling everything after "scale=" will be considered, keep "original" for no changes to the scaling
+        audio_target_bitrate = 192,
+        video_target_file_size = 8,
+        video_target_scale = "1280:-2",
+        min_video_bitrate = 150
     }
 }
 
-local vars = {
-    path = nil,
-    filename = nil,
-    only_filename = nil,
-    directory = nil,
-
-    is_web_mark_pos = nil,
-
-    pos = {
-        start_pos = nil,
-        end_pos = nil,
-        cut_duration = nil
+-- The Fallback Chain: The script will attempt these in order. 
+-- It enforces H.264 and yuv420p on all of them for 100% Discord compatibility.
+local EncoderChain = {
+    {
+        name = "AMD AMF (Hardware)",
+        c_v = "h264_amf",
+        standard_args = {"-rc", "cqp", "-qp_i", "16", "-qp_p", "16", "-pix_fmt", "yuv420p"},
+        web_args = {"-rc", "vbr_peak", "-pix_fmt", "yuv420p"},
+        needs_2pass = false
     },
-    
-    -- Progress tracking
-    progress = {
-        is_encoding = false,
-        current_pass = nil,
-        total_passes = 1,
-        progress_file = nil,
-        progress_timer = nil,
-        duration = nil
+    {
+        name = "VA-API (Hardware - Open Source)",
+        c_v = "h264_vaapi",
+        init_args = {"-vaapi_device", "/dev/dri/renderD128"},
+        filter_prefix = "format=nv12,hwupload",
+        standard_args = {"-qp", "16"},
+        web_args = {},
+        needs_2pass = false
+    },
+    {
+        name = "x264 (Software Fallback)",
+        c_v = "libx264",
+        standard_args = {"-crf", "16", "-preset", "fast", "-pix_fmt", "yuv420p", "-profile:v", "high"},
+        web_args = {"-pix_fmt", "yuv420p", "-profile:v", "high"},
+        needs_2pass = true
     }
 }
--- #endregion
 
--- #region utils
-function str_split(input, separator)
-    if not separator then
-        separator = "%s"
-    end
+-- ============================================================================
+-- 2. STATE MANAGEMENT
+-- ============================================================================
+local State = {
+    file = { path = nil, filename = nil, directory = nil, basename = nil },
+    pos = { start_time = nil, end_time = nil, duration = 0 },
+    progress = { is_encoding = false, timer = nil, file_path = nil, total_duration = 0, current_pass = 1, total_passes = 1 },
+    is_web_mode = false
+}
 
-    local t = {}
-    for str in string.gmatch(input, "([^" .. separator .. "]+)") do
-        table.insert(t, str)
-    end
-
-    return t
+function State.reset_pos()
+    State.pos.start_time = nil
+    State.pos.end_time = nil
+    State.pos.duration = 0
 end
 
-function to_timestamp(time)
-    if not time or time < 0 then
-        time = 0
+-- ============================================================================
+-- 3. UTILITIES & LOGGING
+-- ============================================================================
+local Logger = {}
+
+function Logger.log(level, text, osd_delay)
+    if osd_delay and osd_delay > 0 then mp.osd_message(text, osd_delay) end
+    level(text)
+end
+
+local function to_timestamp(seconds)
+    if not seconds or seconds < 0 then seconds = 0 end
+    local h, m = math.floor(seconds / 3600), math.floor((seconds % 3600) / 60)
+    local s, cs = math.floor(seconds % 60), math.floor((seconds % 1) * 100)
+    return string.format("%02d:%02d:%02d.%02d", h, m, s, cs)
+end
+
+local function get_output_path(filename)
+    if State.file.directory and State.file.directory ~= "" then
+        return utils.join_path(State.file.directory, filename)
     end
-    
-    local hrs = math.floor(time / 3600)
-    local mins = math.floor((time % 3600) / 60)
-    local secs = math.floor(time % 60)
-    local centisecs = math.floor((time % 1) * 100)
-
-    return string.format("%02d:%02d:%02d.%02d", hrs, mins, secs, centisecs)
+    return filename
 end
 
-function reset_pos()
-    vars.pos.start_pos = nil
-    vars.pos.end_pos = nil
-    vars.pos.cut_duration = nil
-end
+-- ============================================================================
+-- 4. SYSTEM & SUBPROCESS
+-- ============================================================================
+local System = {}
 
-function get_output_path(basename)
-    -- Use the same directory as the input file
-    if vars.directory then
-        return utils.join_path(vars.directory, basename)
-    end
-    return basename
-end
-
-function exec_native(args)
-    log(msg.info, string.format("Executing command: %s", table.concat(args, " ")))
-
-    local ret = mp.command_native({
-        name = "subprocess",
-        args = args,
-        capture_stdout = true,
-        capture_stderr = true,
-        playback_only = false
-    })
-
-    if ret.status == 0 then
-        log(msg.info, string.format("Finished executing %s.", args[1]))
-    else
-        log(msg.error, string.format("Command failed: %s", args[1]))
-    end
-
-    return ret.status, ret.stdout, ret.stderr
-end
-
-function exec_async(args, callback)
-    log(msg.info, string.format("Executing command (async): %s", table.concat(args, " ")))
-
+function System.exec_async(args, callback)
+    Logger.log(msg.info, string.format("Executing: %s", table.concat(args, " ")))
     mp.command_native_async({
-        name = "subprocess",
-        args = args,
-        capture_stdout = true,
-        capture_stderr = true,
-        playback_only = false
+        name = "subprocess", args = args, capture_stdout = false, capture_stderr = true, playback_only = false
     }, function(success, result)
         if result.status ~= 0 then
-            local err = result.stderr:gsub("^%s*(.-)%s*$", "%1")
-            log(msg.error, string.format("Command failed: %s", args[1]), nil, err)
-            if callback then callback(false, result) end
+            local err = result.stderr and result.stderr:gsub("^%s*(.-)%s*$", "%1") or "Unknown error"
+            Logger.log(msg.warn, string.format("Command failed: %s", err))
+            if callback then callback(false, err) end
         else
-            log(msg.info, string.format("Finished executing %s.", args[1]))
-            if callback then callback(true, result) end
+            if callback then callback(true, nil) end
         end
     end)
 end
 
-function log(type, fmt, delay, log_msg)
-    if delay and delay > 0 then
-        mp.osd_message(fmt, delay)
+function System.cleanup_temp_files(passlog_path)
+    if not passlog_path then return end
+    for _, file in ipairs({ passlog_path .. "-0.log", passlog_path .. "-0.log.mbtree" }) do
+        os.remove(file)
     end
-
-    if log_msg then
-        local log_path = get_output_path("mpv-cut.log")
-        local file_object = io.open(log_path, 'a')
-
-        if not file_object then
-            log(msg.error, "Unable to open log file for appending!")
-            return
-        end
-
-        local timestamp = os.date("%Y-%m-%d %H:%M:%S")
-        file_object:write(string.format("[%s] %s\n", timestamp, log_msg))
-        file_object:close()
-    end
-
-    type(fmt)
 end
 
-function check_ffmpeg()
-    local status, stdout, stderr = exec_native({"ffmpeg", "-version"})
-    return status == 0
-end
+-- ============================================================================
+-- 5. USER INTERFACE (OSD)
+-- ============================================================================
+local UI = {}
 
-function cleanup_temp_files()
-    local temp_files = {
-        "ffmpeg2pass-0.log",
-        "ffmpeg2pass-0.log.mbtree"
-    }
+function UI.update_progress()
+    if not State.progress.is_encoding or not State.progress.file_path then return end
+    local file = io.open(State.progress.file_path, "r")
+    if not file then return end
     
-    for _, file in ipairs(temp_files) do
-        local file_path = get_output_path(file)
-        local status, err_msg = os.remove(file_path)
-        if not status and err_msg ~= "No such file or directory" then
-            log(msg.warn, string.format("Could not remove temp file %s: %s", file, err_msg))
-        end
-    end
-end
-
--- #region progress tracking
-function parse_progress_file(progress_file)
-    local file = io.open(progress_file, "r")
-    if not file then
-        return nil
-    end
-    
-    local progress_data = {}
+    local data = {}
     for line in file:lines() do
         local key, value = line:match("([^=]+)=(.+)")
-        if key and value then
-            progress_data[key:gsub("^%s*(.-)%s*$", "%1")] = value:gsub("^%s*(.-)%s*$", "%1")
-        end
+        if key and value then data[key:gsub("^%s*(.-)%s*$", "%1")] = value:gsub("^%s*(.-)%s*$", "%1") end
     end
     file:close()
+
+    if not data.frame then return end
+    local out_time = data.out_time_ms and (tonumber(data.out_time_ms) / 1000000.0) or 0
+    local percent = State.progress.total_duration > 0 and math.min(100, math.max(0, (out_time / State.progress.total_duration) * 100)) or 0
     
-    return progress_data
+    local pass_info = State.progress.total_passes > 1 and string.format("Pass %d/%d - ", State.progress.current_pass, State.progress.total_passes) or ""
+    local status_text = string.format("%sEncoding: %.1f%%\nTime: %s / %s | Speed: %s", pass_info, percent, to_timestamp(out_time), to_timestamp(State.progress.total_duration), data.speed or "1.0x")
+    
+    local filled = math.floor(50 * percent / 100)
+    mp.osd_message(string.format("%s\n[%s]", status_text, string.rep("█", filled) .. string.rep("░", 50 - filled)), 0.1)
 end
 
-function time_to_seconds(time_str)
-    -- Parse time in format HH:MM:SS.microseconds or MM:SS.microseconds
-    local parts = {}
-    for part in time_str:gmatch("[^:]+") do
-        table.insert(parts, tonumber(part))
-    end
-    
-    if #parts == 3 then
-        return parts[1] * 3600 + parts[2] * 60 + parts[3]
-    elseif #parts == 2 then
-        return parts[1] * 60 + parts[2]
-    elseif #parts == 1 then
-        return parts[1]
-    end
-    return 0
-end
-
-function update_progress_osd()
-    if not vars.progress.is_encoding or not vars.progress.progress_file then
-        return
-    end
-    
-    local progress_data = parse_progress_file(vars.progress.progress_file)
-    if not progress_data or not progress_data.frame then
-        -- Show "Starting..." message while waiting for progress data
-        local pass_info = ""
-        if vars.progress.total_passes > 1 then
-            pass_info = string.format("Pass %d/%d - ", vars.progress.current_pass or 1, vars.progress.total_passes)
-        end
-        mp.osd_message(string.format("%sStarting encoding...", pass_info), 0.1)
-        return
-    end
-    
-    local out_time = 0
-    
-    -- Try different time formats from ffmpeg progress
-    if progress_data.out_time_ms then
-        -- out_time_ms is in microseconds
-        out_time = tonumber(progress_data.out_time_ms) / 1000000.0
-    elseif progress_data.out_time then
-        local time_str = progress_data.out_time
-        if time_str:match(":") then
-            out_time = time_to_seconds(time_str)
-        else
-            out_time = tonumber(time_str) or 0
-        end
-    end
-    
-    local duration = vars.progress.duration or 0
-    local percent = 0
-    if duration > 0 and out_time > 0 then
-        percent = math.min(100, math.max(0, (out_time / duration) * 100))
-    end
-    
-    local frame = progress_data.frame or "0"
-    local fps = progress_data.fps or "0"
-    local bitrate_kbps = "0"
-    if progress_data.bitrate then
-        -- bitrate is in bits/s, convert to kbps
-        local bitrate_bps = tonumber(progress_data.bitrate) or 0
-        bitrate_kbps = string.format("%.0f", bitrate_bps / 1000)
-    end
-    local speed = progress_data.speed or "1.0x"
-    
-    -- Calculate ETA
-    local eta_str = "N/A"
-    local speed_num = tonumber(speed:match("([%d.]+)")) or 1.0
-    if duration > 0 and out_time > 0 and speed_num > 0 then
-        local remaining = duration - out_time
-        local eta_seconds = remaining / speed_num
-        if eta_seconds > 0 and eta_seconds < 86400 then  -- Less than 24 hours
-            local eta_h = math.floor(eta_seconds / 3600)
-            local eta_m = math.floor((eta_seconds % 3600) / 60)
-            local eta_s = math.floor(eta_seconds % 60)
-            eta_str = string.format("%02d:%02d:%02d", eta_h, eta_m, eta_s)
-        end
-    end
-    
-    -- Build OSD text
-    local pass_info = ""
-    if vars.progress.total_passes > 1 then
-        pass_info = string.format("Pass %d/%d - ", vars.progress.current_pass or 1, vars.progress.total_passes)
-    end
-    
-    local status_text = string.format(
-        "%sEncoding: %.1f%%\n" ..
-        "Time: %s / %s | Speed: %s\n" ..
-        "Frame: %s | FPS: %s | Bitrate: %s kbps\n" ..
-        "ETA: %s",
-        pass_info,
-        percent,
-        to_timestamp(out_time),
-        to_timestamp(duration),
-        speed,
-        frame,
-        fps,
-        bitrate_kbps,
-        eta_str
-    )
-    
-    -- Draw progress bar
-    local bar_width = 50
-    local filled = math.floor(bar_width * percent / 100)
-    local bar = string.rep("█", filled) .. string.rep("░", bar_width - filled)
-    
-    local osd_text = string.format("%s\n[%s]", status_text, bar)
-    
-    -- Display OSD
-    mp.osd_message(osd_text, 0.1)
-end
-
-function start_progress_tracking(progress_file, duration, current_pass, total_passes)
-    vars.progress.is_encoding = true
-    vars.progress.progress_file = progress_file
-    vars.progress.duration = duration
-    vars.progress.current_pass = current_pass
-    vars.progress.total_passes = total_passes or 1
-    
-    -- Clear/create progress file
+function UI.start_tracking(progress_file, duration, current_pass, total_passes)
+    State.progress.is_encoding = true
+    State.progress.file_path = progress_file
+    State.progress.total_duration = duration
+    State.progress.current_pass = current_pass
+    State.progress.total_passes = total_passes
     local file = io.open(progress_file, "w")
-    if file then
-        file:close()
-    end
-    
-    -- Update OSD every 0.1 seconds
-    vars.progress.progress_timer = mp.add_periodic_timer(0.1, update_progress_osd)
-    update_progress_osd()
+    if file then file:close() end
+    State.progress.timer = mp.add_periodic_timer(0.1, UI.update_progress)
 end
 
-function stop_progress_tracking()
-    vars.progress.is_encoding = false
-    if vars.progress.progress_timer then
-        vars.progress.progress_timer:kill()
-        vars.progress.progress_timer = nil
-    end
-    
-    -- Clean up progress file
-    if vars.progress.progress_file then
-        local status, err_msg = os.remove(vars.progress.progress_file)
-        vars.progress.progress_file = nil
-    end
-    
-    -- Clear OSD
+function UI.stop_tracking()
+    State.progress.is_encoding = false
+    if State.progress.timer then State.progress.timer:kill(); State.progress.timer = nil end
+    if State.progress.file_path then os.remove(State.progress.file_path); State.progress.file_path = nil end
     mp.osd_message("", 0)
 end
--- #endregion
--- #endregion
 
--- #region main
-function ffmpeg_cut(time_start, time_end, input_file, output_file, callback)
-    local progress_file = get_output_path("ffmpeg_progress.txt")
-    local cut_duration = vars.pos.cut_duration or 0
-    
-    local args = {"ffmpeg", "-y", "-ss", time_start, "-to", time_end, "-i", input_file}
-    
-    -- Add progress reporting
-    table.insert(args, "-progress")
-    table.insert(args, progress_file)
-    
-    -- Add custom parameters if specified and not in web mode
-    if string.len(settings.ffmpeg_custom_parameters) > 0 and not vars.is_web_mark_pos then
-        for substr in settings.ffmpeg_custom_parameters:gmatch("%S+") do
-            table.insert(args, substr)
-        end
-    else
-        -- Default: copy video, encode audio to AAC
-        table.insert(args, "-c:v")
-        table.insert(args, "copy")
-        table.insert(args, "-c:a")
-        table.insert(args, "aac")
-        table.insert(args, "-b:a")
-        table.insert(args, "320k")
-    end
-    
-    table.insert(args, output_file)
-    
-    -- Start progress tracking
-    start_progress_tracking(progress_file, cut_duration, 1, 1)
-    
-    -- Use async execution for progress tracking
-    exec_async(args, function(success, result)
-        stop_progress_tracking()
-        
-        if not success then
-            local stderr = result.stderr:gsub("^%s*(.-)%s*$", "%1")
-            log(msg.error, string.format("FFmpeg cut failed: %s", stderr), 10, stderr)
-            if callback then callback(false) end
-        else
-            log(msg.info, "FFmpeg cut completed successfully", 3)
-            if callback then callback(true) end
-        end
-    end)
-    
-    -- Return immediately for async execution
-    return true
+-- ============================================================================
+-- 6. MEDIA ENCODING WITH FALLBACK
+-- ============================================================================
+local Media = {}
+
+local function map_audio(args)
+    local aid = mp.get_property_number("aid")
+    table.insert(args, "-map") table.insert(args, "0:v:0")
+    table.insert(args, "-map") table.insert(args, aid and aid > 0 and string.format("0:a:%d", aid - 1) or "0:a?")
 end
 
-function ffmpeg_resize(input_file, output_file, callback)
-    if not vars.pos.cut_duration or vars.pos.cut_duration <= 0 then
-        log(msg.error, "Invalid cut duration!", 10)
-        if callback then callback(false) end
-        return false
+function Media.calculate_web_params(duration)
+    local a_bitrate = Config.web.audio_target_bitrate
+    local v_bitrate = ((Config.web.video_target_file_size * 8192) / duration) - a_bitrate
+    local scale = Config.web.video_target_scale
+
+    if v_bitrate < 1000 then scale = "1280:-2" end 
+    if v_bitrate < 500 then scale = "854:-2" end   
+    if v_bitrate < Config.web.min_video_bitrate then
+        v_bitrate = Config.web.min_video_bitrate
+        scale = "426:-2" 
     end
-    
-    local cut_duration = vars.pos.cut_duration
-    log(msg.info, string.format("Cut duration: %.2f seconds", cut_duration))
-
-    -- Calculate target bitrate (in kbps)
-    -- Convert MB to bits: MB * 8 * 1024 * 1024 / duration (seconds) / 1000 = kbps
-    local total_bitrate = (settings.web.video_target_file_size * 8192) / cut_duration
-    local video_bitrate = total_bitrate - settings.web.audio_target_bitrate
-
-    if video_bitrate < 100 then
-        log(msg.error, string.format("Target video bitrate too low: %d kbps. Increase target file size or duration.", math.floor(video_bitrate)), 10)
-        if callback then callback(false) end
-        return false
-    end
-
-    local formatted_video_bitrate = string.format("%dk", math.floor(video_bitrate))
-    log(msg.info, string.format("Target video bitrate: %s", formatted_video_bitrate), 5)
-
-    -- Build video filter
-    local vf, video_target_scale = "-vf", "scale=iw:ih"
-    if settings.web.video_target_scale ~= "original" then
-        video_target_scale = string.format("scale=%s", settings.web.video_target_scale)
-    end
-
-    local progress_file = get_output_path("ffmpeg_progress.txt")
-
-    -- Two-pass encoding for better quality
-    -- Pass 1: Analyze video (no audio, no output)
-    local pass1_args = {
-        "ffmpeg", "-y", "-i", input_file,
-        "-c:v", "libx264",
-        vf, video_target_scale,
-        "-b:v", formatted_video_bitrate,
-        "-pass", "1",
-        "-an",
-        "-progress", progress_file,
-        "-f", "null"
-    }
-    
-    -- Use /dev/null for Unix, NUL for Windows, or let ffmpeg handle it
-    if package.config:sub(1,1) == "\\" then
-        -- Windows
-        table.insert(pass1_args, "NUL")
-    else
-        -- Unix-like
-        table.insert(pass1_args, "/dev/null")
-    end
-    
-    -- Start progress tracking for pass 1
-    start_progress_tracking(progress_file, cut_duration, 1, 2)
-    
-    exec_async(pass1_args, function(success, result)
-        stop_progress_tracking()
-        
-        if not success then
-            local stderr = result.stderr:gsub("^%s*(.-)%s*$", "%1")
-            log(msg.error, string.format("FFmpeg pass 1 failed: %s", stderr), 10, stderr)
-            cleanup_temp_files()
-            if callback then callback(false) end
-            return
-        end
-        
-        log(msg.info, "Pass 1 completed, starting pass 2...", 3)
-        
-        -- Pass 2: Encode with audio
-        local pass2_args = {
-            "ffmpeg", "-y", "-i", input_file,
-            "-c:v", "libx264",
-            vf, video_target_scale,
-            "-b:v", formatted_video_bitrate,
-            "-pass", "2",
-            "-c:a", "aac",
-            "-b:a", string.format("%dk", settings.web.audio_target_bitrate),
-            "-progress", progress_file,
-            output_file
-        }
-        
-        -- Start progress tracking for pass 2
-        start_progress_tracking(progress_file, cut_duration, 2, 2)
-        
-        exec_async(pass2_args, function(success2, result2)
-            stop_progress_tracking()
-            
-            if not success2 then
-                local stderr = result2.stderr:gsub("^%s*(.-)%s*$", "%1")
-                log(msg.error, string.format("FFmpeg pass 2 failed: %s", stderr), 10, stderr)
-                cleanup_temp_files()
-                if callback then callback(false) end
-                return
-            end
-            
-            -- Clean up two-pass temp files
-            cleanup_temp_files()
-            
-            log(msg.info, "Encoding completed successfully", 3)
-            if callback then callback(true) end
-        end)
-    end)
-    
-    return true
+    return string.format("%dk", math.floor(v_bitrate)), string.format("%dk", a_bitrate), scale
 end
 
-function web_mark_pos()
-    vars.is_web_mark_pos = true
-    mark_pos(vars.is_web_mark_pos)
+function Media.build_base_args(encoder, input_file, progress_file)
+    local args = {"ffmpeg", "-y", "-v", "error"}
+    if encoder.init_args then
+        for _, arg in ipairs(encoder.init_args) do table.insert(args, arg) end
+    end
+    for _, arg in ipairs({"-ss", to_timestamp(State.pos.start_time), "-t", to_timestamp(State.pos.duration), "-i", input_file}) do table.insert(args, arg) end
+    return args
 end
 
-function mark_pos(is_web)
-    local current_pos = mp.get_property_number("time-pos")
-    
-    if not current_pos then
-        log(msg.error, "Could not get current position!", 3)
-        return
+-- Recursive Fallback Executor
+function Media.execute_with_fallback(encoder_idx, is_web, input_file, output_file, callback)
+    local encoder = EncoderChain[encoder_idx]
+    if not encoder then
+        Logger.log(msg.error, "All encoders failed! Check console for FFmpeg errors.", 5)
+        return callback(false)
     end
 
-    msg.info(string.format("Current position: %s", to_timestamp(current_pos)))
+    Logger.log(msg.info, string.format("Attempting encode with: %s", encoder.name), 2)
+    local progress_file = get_output_path("ffmpeg_prog.txt")
+    local args = Media.build_base_args(encoder, input_file, progress_file)
 
-    if not vars.pos.start_pos then
-        vars.pos.start_pos = current_pos
-        log(msg.info, string.format("Marked %s as start position", to_timestamp(current_pos)), 3)
-        return
-    end
+    if is_web then
+        local v_bitrate, a_bitrate, scale = Media.calculate_web_params(State.pos.duration)
+        local scale_cmd = scale == "original" and "scale=iw:ih" or string.format("scale=%s", scale)
+        if encoder.filter_prefix then scale_cmd = scale_cmd .. "," .. encoder.filter_prefix end
 
-    vars.pos.end_pos = current_pos
-
-    if vars.pos.start_pos >= vars.pos.end_pos then
-        log(msg.error, "Invalid time selected! End must be after start.", 3)
-        reset_pos()
-        return
-    end
-
-    -- Calculate duration correctly (end - start)
-    vars.pos.cut_duration = vars.pos.end_pos - vars.pos.start_pos
-
-    log(msg.info, string.format("Marked %s as end position (duration: %.2f s)", 
-        to_timestamp(current_pos), vars.pos.cut_duration), 3)
-
-    -- Generate output filename
-    local base_name = vars.only_filename:match("^(.+)%..+$") or vars.only_filename
-    local output_name = string.format("%s cut.%s", base_name, settings.video_extension)
-    local output_path = get_output_path(output_name)
-
-    -- Cut the video (async with callback)
-    ffmpeg_cut(to_timestamp(vars.pos.start_pos), to_timestamp(vars.pos.end_pos), vars.path, output_path, function(success)
-        if not success then
-            log(msg.error, "Failed to cut video! Check log for details.", 10)
-            reset_pos()
-            return
-        end
-
-        -- Resize video if web mode
-        if is_web then
-            local output_name_resized = string.format("%s cutr.%s", base_name, settings.video_extension)
-            local output_path_resized = get_output_path(output_name_resized)
-
-            log(msg.info, "Starting encoding pass 2...", 3)
-
-            ffmpeg_resize(output_path, output_path_resized, function(resize_success)
-                if not resize_success then
-                    log(msg.error, "Failed to resize video! Check log for details.", 10)
-                    reset_pos()
-                    vars.is_web_mark_pos = false
-                    return
+        if encoder.needs_2pass then
+            local passlog_path = get_output_path("passlog_" .. os.time())
+            local dev_null = package.config:sub(1,1) == "\\" and "NUL" or "/dev/null"
+            
+            -- Pass 1
+            local p1_args = {unpack(args)}
+            for _, arg in ipairs({"-map", "0:v:0", "-c:v", encoder.c_v, "-vf", scale_cmd, "-b:v", v_bitrate, "-pass", "1", "-passlogfile", passlog_path, "-an", "-progress", progress_file, "-f", "null", dev_null}) do table.insert(p1_args, arg) end
+            
+            UI.start_tracking(progress_file, State.pos.duration, 1, 2)
+            System.exec_async(p1_args, function(s1)
+                UI.stop_tracking()
+                if not s1 then
+                    System.cleanup_temp_files(passlog_path)
+                    return Media.execute_with_fallback(encoder_idx + 1, is_web, input_file, output_file, callback)
                 end
-
-                -- Remove intermediate cut file
-                local status, err_msg = os.remove(output_path)
-                if not status and err_msg ~= "No such file or directory" then
-                    log(msg.warn, string.format("Could not delete intermediate file: %s", err_msg))
-                end
-
-                log(msg.info, string.format("Saved as %s", output_path_resized), 10)
-                reset_pos()
-                vars.is_web_mark_pos = false
-                mp.set_property("keep-open", "no")
+                
+                -- Pass 2
+                local p2_args = {unpack(args)}
+                for _, arg in ipairs({"-c:v", encoder.c_v, "-vf", scale_cmd, "-b:v", v_bitrate, "-maxrate", v_bitrate, "-bufsize", v_bitrate, "-pass", "2", "-passlogfile", passlog_path}) do table.insert(p2_args, arg) end
+                for _, arg in ipairs(encoder.web_args) do table.insert(p2_args, arg) end
+                map_audio(p2_args)
+                for _, arg in ipairs({"-c:a", "aac", "-b:a", a_bitrate, "-progress", progress_file, output_file}) do table.insert(p2_args, arg) end
+                
+                UI.start_tracking(progress_file, State.pos.duration, 2, 2)
+                System.exec_async(p2_args, function(s2)
+                    UI.stop_tracking()
+                    System.cleanup_temp_files(passlog_path)
+                    if not s2 then return Media.execute_with_fallback(encoder_idx + 1, is_web, input_file, output_file, callback) end
+                    callback(true)
+                end)
             end)
         else
-            -- Reset vars
-            reset_pos()
-            mp.set_property("keep-open", "no")
-            log(msg.info, string.format("Saved as %s", output_path), 10)
+            -- 1-Pass Hardware Web Encode
+            for _, arg in ipairs({"-c:v", encoder.c_v, "-vf", scale_cmd, "-b:v", v_bitrate, "-maxrate", v_bitrate, "-bufsize", v_bitrate}) do table.insert(args, arg) end
+            for _, arg in ipairs(encoder.web_args) do table.insert(args, arg) end
+            map_audio(args)
+            for _, arg in ipairs({"-c:a", "aac", "-b:a", a_bitrate, "-progress", progress_file, output_file}) do table.insert(args, arg) end
+            
+            UI.start_tracking(progress_file, State.pos.duration, 1, 1)
+            System.exec_async(args, function(s1)
+                UI.stop_tracking()
+                if not s1 then return Media.execute_with_fallback(encoder_idx + 1, is_web, input_file, output_file, callback) end
+                callback(true)
+            end)
         end
+    else
+        -- Standard Cut
+        local filter = encoder.filter_prefix and { "-vf", encoder.filter_prefix } or {}
+        for _, arg in ipairs(filter) do table.insert(args, arg) end
+        table.insert(args, "-c:v") table.insert(args, encoder.c_v)
+        for _, arg in ipairs(encoder.standard_args) do table.insert(args, arg) end
+        map_audio(args)
+        for _, arg in ipairs({"-c:a", "aac", "-b:a", "320k", "-progress", progress_file, output_file}) do table.insert(args, arg) end
+
+        UI.start_tracking(progress_file, State.pos.duration, 1, 1)
+        System.exec_async(args, function(success)
+            UI.stop_tracking()
+            if not success then return Media.execute_with_fallback(encoder_idx + 1, is_web, input_file, output_file, callback) end
+            callback(true)
+        end)
+    end
+end
+
+-- ============================================================================
+-- 7. APPLICATION LOGIC & BINDS
+-- ============================================================================
+local function process_cut()
+    local current_time = mp.get_property_number("time-pos")
+    if not current_time then return end
+
+    if not State.pos.start_time then
+        State.pos.start_time = current_time
+        return Logger.log(msg.info, string.format("Start marked: %s", to_timestamp(current_time)), 3)
+    end
+
+    State.pos.end_time = current_time
+    if State.pos.start_time >= State.pos.end_time then
+        State.reset_pos()
+        return Logger.log(msg.error, "Invalid selection.", 3)
+    end
+
+    State.pos.duration = State.pos.end_time - State.pos.start_time
+    
+    local suffix = State.is_web_mode and "_web" or "_cut"
+    local output = get_output_path(string.format("%s%s.%s", State.file.basename, suffix, Config.video_extension))
+    
+    Media.execute_with_fallback(1, State.is_web_mode, State.file.path, output, function(success)
+        if success then Logger.log(msg.info, string.format("Saved: %s", output), 5) end
+        State.reset_pos()
+        mp.set_property("keep-open", "no")
     end)
 end
--- #endregion
 
--- #region events
 mp.register_event("file-loaded", function()
-    local only_filename = mp.get_property("filename")
-    local path = mp.get_property("path")
-    local directory, filename = utils.split_path(path)
-
+    State.file.path = mp.get_property("path")
+    State.file.filename = mp.get_property("filename")
+    State.file.directory, _ = utils.split_path(State.file.path)
+    State.file.basename = State.file.filename:match("^(.+)%..+$") or State.file.filename
     mp.set_property("keep-open", "always")
-
-    -- Populate variables
-    vars.path = path
-    vars.filename = filename
-    vars.only_filename = only_filename
-    vars.directory = directory
-    
-    -- Reset position markers for new file
-    reset_pos()
-    
-    -- Check if ffmpeg is available
-    if not check_ffmpeg() then
-        log(msg.error, "FFmpeg not found! Please install ffmpeg.", 10)
-    end
+    State.reset_pos()
 end)
 
-mp.add_key_binding(settings.key_mark_cut, "mark_pos", mark_pos)
-mp.add_key_binding(settings.web.key_mark_cut, "web_mark_pos", web_mark_pos)
--- #endregion
+mp.add_key_binding(Config.key_mark_cut, "mark_pos", function() State.is_web_mode = false process_cut() end)
+mp.add_key_binding(Config.web_key_mark_cut, "web_mark_pos", function() State.is_web_mode = true process_cut() end)
