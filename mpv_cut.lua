@@ -19,8 +19,6 @@ local Config = {
     }
 }
 
--- The Fallback Chain: The script will attempt these in order. 
--- It enforces H.264 and yuv420p on all of them for 100% Discord compatibility.
 local EncoderChain = {
     {
         name = "AMD AMF (Hardware)",
@@ -194,7 +192,6 @@ function Media.build_base_args(encoder, input_file, progress_file)
     return args
 end
 
--- Recursive Fallback Executor
 function Media.execute_with_fallback(encoder_idx, is_web, input_file, output_file, callback)
     local encoder = EncoderChain[encoder_idx]
     if not encoder then
@@ -257,7 +254,6 @@ function Media.execute_with_fallback(encoder_idx, is_web, input_file, output_fil
             end)
         end
     else
-        -- Standard Cut
         local filter = encoder.filter_prefix and { "-vf", encoder.filter_prefix } or {}
         for _, arg in ipairs(filter) do table.insert(args, arg) end
         table.insert(args, "-c:v") table.insert(args, encoder.c_v)
