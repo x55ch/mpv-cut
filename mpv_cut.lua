@@ -10,6 +10,7 @@ local Config = {
     key_mark_cut = "c",
     web_key_mark_cut = "shift+c",
     video_extension = "mp4",
+    ytdl_path = "yt-dlp",
 
     web = {
         audio_target_bitrate = 192,
@@ -49,7 +50,7 @@ local EncoderChain = {
 -- 2. STATE MANAGEMENT
 -- ============================================================================
 local State = {
-    file = { path = nil, filename = nil, directory = nil, basename = nil },
+    file = { path = nil, filename = nil, directory = nil, basename = nil, is_remote = false },
     pos = { start_time = nil, end_time = nil, duration = 0 },
     progress = { is_encoding = false, timer = nil, file_path = nil, total_duration = 0, current_pass = 1, total_passes = 1 },
     is_web_mode = false
@@ -85,6 +86,20 @@ local function get_output_path(filename)
     return filename
 end
 
+-- Only http/https trigger the streamed-source path below; everything else
+-- (plain local paths, smb://, etc.) falls through to the original,
+-- untouched local-file logic.
+local function is_url(path)
+    return path ~= nil and path:match("^https?://") ~= nil
+end
+
+local function sanitize_filename(name)
+    name = name:gsub('[<>:"/\\|?*%%]', "_")
+    name = name:gsub("^%s+", ""):gsub("%s+$", "")
+    if name == "" then name = "stream" end
+    return name
+end
+
 -- ============================================================================
 -- 4. SYSTEM & SUBPROCESS
 -- ============================================================================
@@ -102,6 +117,16 @@ function System.exec_async(args, callback)
         else
             if callback then callback(true, nil) end
         end
+    end)
+end
+
+-- Like exec_async, but captures stdout (used to read yt-dlp's JSON output).
+function System.exec_capture_async(args, callback)
+    Logger.log(msg.info, string.format("Executing: %s", table.concat(args, " ")))
+    mp.command_native_async({
+        name = "subprocess", args = args, capture_stdout = true, capture_stderr = true, playback_only = false
+    }, function(success, result)
+        callback(success, result)
     end)
 end
 
@@ -163,10 +188,94 @@ end
 -- ============================================================================
 local Media = {}
 
-local function map_audio(args)
-    local aid = mp.get_property_number("aid")
-    table.insert(args, "-map") table.insert(args, "0:v:0")
-    table.insert(args, "-map") table.insert(args, aid and aid > 0 and string.format("0:a:%d", aid - 1) or "0:a?")
+-- Finds the 0-based ffmpeg input index of the first source flagged with `key`
+-- ("is_video" / "is_audio"). For a single local/progressive source this is
+-- always 0, matching the original hardcoded "0:v:0" / "0:a:*" behavior.
+local function find_source_index(sources, key)
+    for i, s in ipairs(sources) do
+        if s[key] then return i - 1 end
+    end
+    return 0
+end
+
+local function map_audio(args, sources)
+    local video_idx = find_source_index(sources, "is_video")
+    table.insert(args, "-map") table.insert(args, string.format("%d:v:0", video_idx))
+
+    if #sources > 1 then
+        -- Adaptive stream: video and audio came from two separate inputs.
+        local audio_idx = find_source_index(sources, "is_audio")
+        table.insert(args, "-map") table.insert(args, string.format("%d:a:0", audio_idx))
+    elseif State.file.is_remote then
+        -- Single progressive stream URL - just take whatever audio it has.
+        table.insert(args, "-map") table.insert(args, "0:a?")
+    else
+        -- Local file: original behavior, respects mpv's selected audio track.
+        local aid = mp.get_property_number("aid")
+        table.insert(args, "-map") table.insert(args, aid and aid > 0 and string.format("0:a:%d", aid - 1) or "0:a?")
+    end
+end
+
+function Media.format_headers(headers)
+    if not headers then return nil end
+    local lines = {}
+    for k, v in pairs(headers) do
+        table.insert(lines, string.format("%s: %s", k, v))
+    end
+    if #lines == 0 then return nil end
+    return table.concat(lines, "\r\n") .. "\r\n"
+end
+
+-- Resolves a page URL (YouTube, etc.) to direct, ffmpeg-fetchable media
+-- URL(s) via yt-dlp. Called right when the cut is confirmed, so the links
+-- (which typically expire) are as fresh as possible.
+function Media.resolve_remote_source(url, callback)
+    Logger.log(msg.info, "Resolving stream with yt-dlp...", 0)
+    mp.osd_message("Resolving stream URL...", 0)
+
+    System.exec_capture_async(
+        { Config.ytdl_path, "-j", "--no-warnings", "--no-playlist", url },
+        function(success, result)
+            mp.osd_message("", 0)
+
+            if not success or not result.stdout or result.stdout == "" then
+                local err = (result and result.stderr) or "yt-dlp failed to run"
+                return callback(false, err)
+            end
+
+            local json, err = utils.parse_json(result.stdout)
+            if not json then
+                return callback(false, "Could not parse yt-dlp output: " .. tostring(err))
+            end
+
+            local sources = {}
+            if json.requested_formats and #json.requested_formats > 0 then
+                -- Adaptive/DASH: separate video-only and audio-only streams.
+                for _, fmt in ipairs(json.requested_formats) do
+                    table.insert(sources, {
+                        url = fmt.url,
+                        headers = Media.format_headers(fmt.http_headers),
+                        is_video = fmt.vcodec and fmt.vcodec ~= "none",
+                        is_audio = fmt.acodec and fmt.acodec ~= "none"
+                    })
+                end
+            elseif json.url then
+                -- Progressive: a single URL carries both video and audio.
+                table.insert(sources, {
+                    url = json.url,
+                    headers = Media.format_headers(json.http_headers),
+                    is_video = true,
+                    is_audio = true
+                })
+            end
+
+            if #sources == 0 then
+                return callback(false, "yt-dlp did not return a usable stream URL")
+            end
+
+            callback(true, sources)
+        end
+    )
 end
 
 function Media.calculate_web_params(duration)
@@ -183,16 +292,27 @@ function Media.calculate_web_params(duration)
     return string.format("%dk", math.floor(v_bitrate)), string.format("%dk", a_bitrate), scale
 end
 
-function Media.build_base_args(encoder, input_file, progress_file)
+-- `sources` is a list of { url, headers, is_video, is_audio } tables:
+-- one entry for a local file or a progressive stream, two entries
+-- (video-only + audio-only) for an adaptive stream resolved via yt-dlp.
+function Media.build_base_args(encoder, sources, progress_file)
     local args = {"ffmpeg", "-y", "-v", "error"}
     if encoder.init_args then
         for _, arg in ipairs(encoder.init_args) do table.insert(args, arg) end
     end
-    for _, arg in ipairs({"-ss", to_timestamp(State.pos.start_time), "-t", to_timestamp(State.pos.duration), "-i", input_file}) do table.insert(args, arg) end
+    for _, source in ipairs(sources) do
+        if source.headers then
+            table.insert(args, "-headers")
+            table.insert(args, source.headers)
+        end
+        for _, arg in ipairs({"-ss", to_timestamp(State.pos.start_time), "-t", to_timestamp(State.pos.duration), "-i", source.url}) do
+            table.insert(args, arg)
+        end
+    end
     return args
 end
 
-function Media.execute_with_fallback(encoder_idx, is_web, input_file, output_file, callback)
+function Media.execute_with_fallback(encoder_idx, is_web, sources, output_file, callback)
     local encoder = EncoderChain[encoder_idx]
     if not encoder then
         Logger.log(msg.error, "All encoders failed! Check console for FFmpeg errors.", 5)
@@ -201,7 +321,8 @@ function Media.execute_with_fallback(encoder_idx, is_web, input_file, output_fil
 
     Logger.log(msg.info, string.format("Attempting encode with: %s", encoder.name), 2)
     local progress_file = get_output_path("ffmpeg_prog.txt")
-    local args = Media.build_base_args(encoder, input_file, progress_file)
+    local args = Media.build_base_args(encoder, sources, progress_file)
+    local video_idx = find_source_index(sources, "is_video")
 
     if is_web then
         local v_bitrate, a_bitrate, scale = Media.calculate_web_params(State.pos.duration)
@@ -214,28 +335,28 @@ function Media.execute_with_fallback(encoder_idx, is_web, input_file, output_fil
             
             -- Pass 1
             local p1_args = {unpack(args)}
-            for _, arg in ipairs({"-map", "0:v:0", "-c:v", encoder.c_v, "-vf", scale_cmd, "-b:v", v_bitrate, "-pass", "1", "-passlogfile", passlog_path, "-an", "-progress", progress_file, "-f", "null", dev_null}) do table.insert(p1_args, arg) end
+            for _, arg in ipairs({"-map", string.format("%d:v:0", video_idx), "-c:v", encoder.c_v, "-vf", scale_cmd, "-b:v", v_bitrate, "-pass", "1", "-passlogfile", passlog_path, "-an", "-progress", progress_file, "-f", "null", dev_null}) do table.insert(p1_args, arg) end
             
             UI.start_tracking(progress_file, State.pos.duration, 1, 2)
             System.exec_async(p1_args, function(s1)
                 UI.stop_tracking()
                 if not s1 then
                     System.cleanup_temp_files(passlog_path)
-                    return Media.execute_with_fallback(encoder_idx + 1, is_web, input_file, output_file, callback)
+                    return Media.execute_with_fallback(encoder_idx + 1, is_web, sources, output_file, callback)
                 end
                 
                 -- Pass 2
                 local p2_args = {unpack(args)}
                 for _, arg in ipairs({"-c:v", encoder.c_v, "-vf", scale_cmd, "-b:v", v_bitrate, "-maxrate", v_bitrate, "-bufsize", v_bitrate, "-pass", "2", "-passlogfile", passlog_path}) do table.insert(p2_args, arg) end
                 for _, arg in ipairs(encoder.web_args) do table.insert(p2_args, arg) end
-                map_audio(p2_args)
+                map_audio(p2_args, sources)
                 for _, arg in ipairs({"-c:a", "aac", "-b:a", a_bitrate, "-progress", progress_file, output_file}) do table.insert(p2_args, arg) end
                 
                 UI.start_tracking(progress_file, State.pos.duration, 2, 2)
                 System.exec_async(p2_args, function(s2)
                     UI.stop_tracking()
                     System.cleanup_temp_files(passlog_path)
-                    if not s2 then return Media.execute_with_fallback(encoder_idx + 1, is_web, input_file, output_file, callback) end
+                    if not s2 then return Media.execute_with_fallback(encoder_idx + 1, is_web, sources, output_file, callback) end
                     callback(true)
                 end)
             end)
@@ -243,13 +364,13 @@ function Media.execute_with_fallback(encoder_idx, is_web, input_file, output_fil
             -- 1-Pass Hardware Web Encode
             for _, arg in ipairs({"-c:v", encoder.c_v, "-vf", scale_cmd, "-b:v", v_bitrate, "-maxrate", v_bitrate, "-bufsize", v_bitrate}) do table.insert(args, arg) end
             for _, arg in ipairs(encoder.web_args) do table.insert(args, arg) end
-            map_audio(args)
+            map_audio(args, sources)
             for _, arg in ipairs({"-c:a", "aac", "-b:a", a_bitrate, "-progress", progress_file, output_file}) do table.insert(args, arg) end
             
             UI.start_tracking(progress_file, State.pos.duration, 1, 1)
             System.exec_async(args, function(s1)
                 UI.stop_tracking()
-                if not s1 then return Media.execute_with_fallback(encoder_idx + 1, is_web, input_file, output_file, callback) end
+                if not s1 then return Media.execute_with_fallback(encoder_idx + 1, is_web, sources, output_file, callback) end
                 callback(true)
             end)
         end
@@ -258,13 +379,13 @@ function Media.execute_with_fallback(encoder_idx, is_web, input_file, output_fil
         for _, arg in ipairs(filter) do table.insert(args, arg) end
         table.insert(args, "-c:v") table.insert(args, encoder.c_v)
         for _, arg in ipairs(encoder.standard_args) do table.insert(args, arg) end
-        map_audio(args)
+        map_audio(args, sources)
         for _, arg in ipairs({"-c:a", "aac", "-b:a", "320k", "-progress", progress_file, output_file}) do table.insert(args, arg) end
 
         UI.start_tracking(progress_file, State.pos.duration, 1, 1)
         System.exec_async(args, function(success)
             UI.stop_tracking()
-            if not success then return Media.execute_with_fallback(encoder_idx + 1, is_web, input_file, output_file, callback) end
+            if not success then return Media.execute_with_fallback(encoder_idx + 1, is_web, sources, output_file, callback) end
             callback(true)
         end)
     end
@@ -292,19 +413,43 @@ local function process_cut()
     
     local suffix = State.is_web_mode and "_web" or "_cut"
     local output = get_output_path(string.format("%s%s.%s", State.file.basename, suffix, Config.video_extension))
-    
-    Media.execute_with_fallback(1, State.is_web_mode, State.file.path, output, function(success)
-        if success then Logger.log(msg.info, string.format("Saved: %s", output), 5) end
-        State.reset_pos()
-        mp.set_property("keep-open", "no")
-    end)
+
+    local function start_encode(sources)
+        Media.execute_with_fallback(1, State.is_web_mode, sources, output, function(success)
+            if success then Logger.log(msg.info, string.format("Saved: %s", output), 5) end
+            State.reset_pos()
+            mp.set_property("keep-open", "no")
+        end)
+    end
+
+    if State.file.is_remote then
+        -- Resolve fresh direct URL(s) right now, since streamed links expire.
+        Media.resolve_remote_source(State.file.path, function(ok, result)
+            if not ok then
+                Logger.log(msg.error, "Failed to resolve stream: " .. tostring(result), 5)
+                State.reset_pos()
+                return
+            end
+            start_encode(result)
+        end)
+    else
+        start_encode({ { url = State.file.path, is_video = true, is_audio = true } })
+    end
 end
 
 mp.register_event("file-loaded", function()
     State.file.path = mp.get_property("path")
-    State.file.filename = mp.get_property("filename")
-    State.file.directory, _ = utils.split_path(State.file.path)
-    State.file.basename = State.file.filename:match("^(.+)%..+$") or State.file.filename
+    State.file.is_remote = is_url(State.file.path)
+
+    if State.file.is_remote then
+        State.file.directory = mp.get_property("working-directory") or ""
+        State.file.basename = sanitize_filename(mp.get_property("media-title") or "stream")
+    else
+        State.file.filename = mp.get_property("filename")
+        State.file.directory, _ = utils.split_path(State.file.path)
+        State.file.basename = State.file.filename:match("^(.+)%..+$") or State.file.filename
+    end
+
     mp.set_property("keep-open", "always")
     State.reset_pos()
 end)
